@@ -121,6 +121,7 @@ type Server struct {
 	locations                                        map[string]Location
 	monitorCancel                                    context.CancelFunc
 	monitorSafetyOp                                  sync.Mutex
+	monitorNetworkOp                                 sync.Mutex
 	safetyOp                                         sync.Mutex
 	networkPaused                                    bool
 	proxyNetworkLost                                 bool

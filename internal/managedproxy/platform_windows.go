@@ -9,9 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/sylvinus/agent-vm/internal/diagnostics"
 	"github.com/sylvinus/agent-vm/internal/host"
@@ -256,35 +258,139 @@ func startWindowsCore(ctx context.Context, profile string, s Store) error {
 }
 
 func windowsPhysicalInterface(ctx context.Context) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	// Select only hardware adapters with a usable IPv4 default route. Virtual
-	// VPN/TUN adapters never become the proxy's underlying host connection.
-	const script = `$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $candidates=@(Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | ForEach-Object { $a=$_; $ip=Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.AddressState -eq 'Preferred' -and $_.IPAddress -notlike '169.254.*' }; $routes=Get-NetRoute -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue; if ($ip) { $routes | Where-Object { $_.NextHop -ne '0.0.0.0' } | ForEach-Object { [pscustomobject]@{Name=$a.Name;Index=$a.ifIndex;Metric=($_.RouteMetric+$_.InterfaceMetric)} } } }); $best=$candidates | Sort-Object Metric,Index | Select-Object -First 1; if (!$best) { exit 2 }; $best | ConvertTo-Json -Compress`
-	root := os.Getenv("SystemRoot")
-	if root == "" {
-		root = `C:\Windows`
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
-	cmd := exec.CommandContext(ctx, filepath.Join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"), "-NoProfile", "-NonInteractive", "-Command", script)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	out, err := cmd.Output()
+	selected, err := selectWindowsPhysicalInterface(windowsNetworkInterfaces(), windowsIPv4DefaultRoutes())
 	if err != nil {
-		var exited *exec.ExitError
-		if errors.As(err, &exited) && exited.ExitCode() == 2 {
-			return "", errors.New("未找到可用的物理 IPv4 网卡。请连接以太网或 Wi-Fi；仅有虚拟网卡的 Windows 虚拟机和云主机暂不可用。Cage 外网保持关闭")
-		}
-		return "", errors.New("无法读取 Windows 物理网卡信息，请确认系统网络服务正常后重试；Cage 外网保持关闭")
+		return "", err
 	}
-	var selected struct {
-		Name  string
-		Index int
-	}
-	if json.Unmarshal(out, &selected) != nil || selected.Name == "" || selected.Index <= 0 {
-		return "", errors.New("Windows 物理网卡信息无效")
-	}
-	iface, err := net.InterfaceByIndex(selected.Index)
+	iface, err := net.InterfaceByIndex(selected.index)
 	if err != nil || iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 		return "", errors.New("物理网卡已断开，请重试")
 	}
+	if !strings.EqualFold(iface.Name, selected.name) {
+		return "", errors.New("物理网卡信息已变化，请重试")
+	}
 	return iface.Name, nil
+}
+
+type windowsInterface struct {
+	index    int
+	name     string
+	physical bool
+	up       bool
+	usable   bool
+}
+
+type windowsRoute struct {
+	index  int
+	metric uint32
+}
+
+type windowsSelectedInterface struct {
+	index int
+	name  string
+}
+
+func selectWindowsPhysicalInterface(interfaces []windowsInterface, routes []windowsRoute) (windowsSelectedInterface, error) {
+	usable := make(map[int]windowsInterface, len(interfaces))
+	for _, candidate := range interfaces {
+		if candidate.index > 0 && candidate.physical && candidate.up && candidate.usable {
+			usable[candidate.index] = candidate
+		}
+	}
+	type scoredRoute struct {
+		windowsInterface
+		metric uint32
+	}
+	scored := make([]scoredRoute, 0, len(routes))
+	for _, route := range routes {
+		if candidate, ok := usable[route.index]; ok {
+			scored = append(scored, scoredRoute{windowsInterface: candidate, metric: route.metric})
+		}
+	}
+	sort.Slice(scored, func(i, j int) bool {
+		if scored[i].metric != scored[j].metric {
+			return scored[i].metric < scored[j].metric
+		}
+		return scored[i].index < scored[j].index
+	})
+	if len(scored) > 0 {
+		return windowsSelectedInterface{index: scored[0].index, name: scored[0].name}, nil
+	}
+	for _, candidate := range interfaces {
+		if _, ok := usable[candidate.index]; ok {
+			return windowsSelectedInterface{index: candidate.index, name: candidate.name}, nil
+		}
+	}
+	return windowsSelectedInterface{}, errors.New("未找到可用的物理 IPv4 网卡。请连接以太网或 Wi-Fi；仅有虚拟网卡的 Windows 虚拟机和云主机暂不可用。Cage 外网保持关闭")
+}
+
+func windowsNetworkInterfaces() []windowsInterface {
+	const flags = windows.GAA_FLAG_SKIP_ANYCAST |
+		windows.GAA_FLAG_SKIP_MULTICAST |
+		windows.GAA_FLAG_SKIP_DNS_SERVER |
+		windows.GAA_FLAG_INCLUDE_TUNNEL_BINDINGORDER
+	var needed uint32
+	if err := windows.GetAdaptersAddresses(windows.AF_UNSPEC, flags, 0, nil, &needed); err != nil && err != windows.ERROR_BUFFER_OVERFLOW {
+		return nil
+	}
+	buffer := make([]byte, needed)
+	addresses := (*windows.IpAdapterAddresses)(unsafe.Pointer(&buffer[0]))
+	if err := windows.GetAdaptersAddresses(windows.AF_UNSPEC, flags, 0, addresses, &needed); err != nil {
+		return nil
+	}
+	var result []windowsInterface
+	for adapter := addresses; adapter != nil; adapter = adapter.Next {
+		if adapter.IfIndex == 0 || adapter.FriendlyName == nil {
+			continue
+		}
+		candidate := windowsInterface{
+			index:    int(adapter.IfIndex),
+			name:     windows.UTF16ToString(unsafe.Slice(adapter.FriendlyName, 1<<16)),
+			physical: physicalAdapterType(adapter.IfType, adapter.TunnelType),
+			up:       adapter.OperStatus == windows.IfOperStatusUp,
+		}
+		for address := adapter.FirstUnicastAddress; address != nil; address = address.Next {
+			ip := address.Address.IP()
+			if ip == nil || ip.To4() == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+				continue
+			}
+			if address.DadState == windows.NldsPreferred {
+				candidate.usable = true
+				break
+			}
+		}
+		result = append(result, candidate)
+	}
+	return result
+}
+func physicalAdapterType(interfaceType, tunnelType uint32) bool {
+	switch interfaceType {
+	case windows.IF_TYPE_ETHERNET_CSMACD, windows.IF_TYPE_IEEE80211, windows.IF_TYPE_IEEE1394:
+		return tunnelType == 0
+	default:
+		return false
+	}
+}
+
+func windowsIPv4DefaultRoutes() []windowsRoute {
+	var table *windows.MibIpForwardTable2
+	if err := windows.GetIpForwardTable2(windows.AF_INET, &table); err != nil {
+		return nil
+	}
+	defer windows.FreeMibTable(unsafe.Pointer(table))
+	var routes []windowsRoute
+	for _, row := range table.Rows() {
+		if row.DestinationPrefix.PrefixLength != 0 || row.NextHop.Family != windows.AF_INET || row.InterfaceIndex == 0 {
+			continue
+		}
+		nextHop := (*windows.RawSockaddrInet4)(unsafe.Pointer(&row.NextHop)).Addr[:]
+		if net.IP(nextHop).Equal(net.IPv4zero) {
+			continue
+		}
+		routes = append(routes, windowsRoute{index: int(row.InterfaceIndex), metric: row.Metric})
+	}
+	return routes
 }

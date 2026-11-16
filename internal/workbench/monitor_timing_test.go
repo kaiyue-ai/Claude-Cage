@@ -48,27 +48,22 @@ func monitorTimingRecords(t *testing.T, s *Server, kind string) []map[string]str
 	return records
 }
 
-func TestNetworkMonitorRecordsRepeatedLockSkips(t *testing.T) {
+func TestNetworkMonitorRunsWhileOperationLockIsHeld(t *testing.T) {
 	s := testServer(t)
 	s.ready = true
-	s.safety.VerifiedAt = time.Now().Add(-85 * time.Second)
-	s.safety.Gate = &cage.GateStatus{Mode: cage.GateOpen, Until: time.Now().Add(5 * time.Second)}
+	previous := physicalProxyInterface
+	physicalProxyInterface = func(context.Context) (string, error) { return "en0", nil }
+	t.Cleanup(func() { physicalProxyInterface = previous })
 	s.op.Lock()
 	defer s.op.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 5200*time.Millisecond)
-	defer cancel()
-	s.monitorNetwork(ctx)
+	s.monitorNetworkWithTick(s.monitorNetworkTick)
 	records := monitorTimingRecords(t, s, "network")
-	if len(records) != 2 {
-		t.Fatalf("expected both skipped ticks, got %v", records)
+	if len(records) != 1 {
+		t.Fatalf("expected one monitor round, got %v", records)
 	}
-	for i, record := range records {
-		if record["result"] != "operation_lock_busy" || record["consecutive_lock_skips"] != strconv.Itoa(i+1) {
-			t.Fatalf("missing lock skip evidence: %v", record)
-		}
-		age, _ := strconv.Atoi(record["verified_age_ms"])
-		if age < 85000 {
-			t.Fatalf("missing late verification age: %v", record)
+	for _, stage := range []string{"physical_interface", "proxy_health", "safety", "recovery", "subscriptions"} {
+		if records[0][stage+"_ms"] == "" {
+			t.Fatalf("missing %s stage: %v", stage, records[0])
 		}
 	}
 }

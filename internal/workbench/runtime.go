@@ -691,25 +691,25 @@ func (s *Server) monitorNetworkTick() {
 func (s *Server) monitorNetwork(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	skipped := 0
 	for ctx.Err() == nil {
-		if s.op.TryLock() {
-			skipped = 0
-			s.monitorNetworkTick()
-			s.op.Unlock()
-		} else {
-			skipped++
-			timing := s.startMonitorTiming()
-			timing.result = "operation_lock_busy"
-			timing.stages = append(timing.stages, fmt.Sprintf("consecutive_lock_skips=%d", skipped))
-			s.recordMonitorTiming("network", timing)
-		}
+		s.monitorNetworkWithTick(s.monitorNetworkTick)
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
 	}
+}
+
+func (s *Server) monitorNetworkWithTick(tick func()) {
+	if !s.monitorNetworkOp.TryLock() {
+		timing := s.startMonitorTiming()
+		timing.result = "monitor_busy"
+		s.recordMonitorTiming("network", timing)
+		return
+	}
+	defer s.monitorNetworkOp.Unlock()
+	tick()
 }
 
 func vmAlive(profile, workspace string) bool {
