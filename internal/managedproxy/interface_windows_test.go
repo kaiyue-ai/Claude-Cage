@@ -6,15 +6,15 @@ import (
 
 func TestSelectWindowsPhysicalInterfacePrefersBestDefaultRoute(t *testing.T) {
 	interfaces := []windowsInterface{
-		{index: 1, name: "Loopback Pseudo-Interface 1", physical: true, up: true, usable: true},
-		{index: 2, name: "Ethernet", physical: true, up: true, usable: true},
-		{index: 3, name: "Wi-Fi", physical: true, up: true, usable: true},
-		{index: 4, name: "VPN", physical: false, up: true, usable: true},
-		{index: 5, name: "Disconnected", physical: true, up: false, usable: true},
+		{index: 1, name: "Loopback Pseudo-Interface 1", hardware: false, up: true, usable: true, interfaceType: 6},
+		{index: 2, name: "Ethernet", hardware: true, up: true, usable: true, interfaceType: 6, interfaceMetric: 25},
+		{index: 3, name: "Wi-Fi", hardware: true, up: true, usable: true, interfaceType: 71, interfaceMetric: 55},
+		{index: 4, name: "vEthernet", hardware: false, up: true, usable: true, interfaceType: 6},
+		{index: 5, name: "Disconnected", hardware: true, up: false, usable: true, interfaceType: 6},
 	}
 	routes := []windowsRoute{
 		{index: 4, metric: 1},
-		{index: 3, metric: 25},
+		{index: 3, metric: 0},
 		{index: 2, metric: 10},
 	}
 	selected, err := selectWindowsPhysicalInterface(interfaces, routes)
@@ -28,8 +28,8 @@ func TestSelectWindowsPhysicalInterfacePrefersBestDefaultRoute(t *testing.T) {
 
 func TestSelectWindowsPhysicalInterfaceFallsBackToAnyUsableAdapter(t *testing.T) {
 	interfaces := []windowsInterface{
-		{index: 7, name: "Wi-Fi", physical: true, up: true, usable: true},
-		{index: 8, name: "Ethernet", physical: true, up: true, usable: true},
+		{index: 8, name: "Ethernet", hardware: true, up: true, usable: true, interfaceType: 6},
+		{index: 7, name: "Wi-Fi", hardware: true, up: true, usable: true, interfaceType: 71},
 	}
 	selected, err := selectWindowsPhysicalInterface(interfaces, nil)
 	if err != nil {
@@ -41,10 +41,18 @@ func TestSelectWindowsPhysicalInterfaceFallsBackToAnyUsableAdapter(t *testing.T)
 }
 
 func TestSelectWindowsPhysicalInterfaceRejectsVirtualOnlyNetwork(t *testing.T) {
-	interfaces := []windowsInterface{{index: 4, name: "VPN", physical: false, up: true, usable: true}}
+	interfaces := []windowsInterface{{index: 4, name: "VPN", hardware: false, up: true, usable: true, interfaceType: 6}}
 	routes := []windowsRoute{{index: 4, metric: 1}}
 	if _, err := selectWindowsPhysicalInterface(interfaces, routes); err == nil {
 		t.Fatal("accepted a virtual-only adapter")
+	}
+}
+
+func TestSelectWindowsPhysicalInterfaceRequiresDefaultRoute(t *testing.T) {
+	interfaces := []windowsInterface{{index: 2, name: "Ethernet", hardware: true, up: true, usable: true, interfaceType: 6}}
+	virtualRoutes := []windowsRoute{{index: 9, metric: 1}}
+	if _, err := selectWindowsPhysicalInterface(interfaces, virtualRoutes); err == nil {
+		t.Fatal("selected an adapter without a default route")
 	}
 }
 

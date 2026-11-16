@@ -261,7 +261,15 @@ func windowsPhysicalInterface(ctx context.Context) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	selected, err := selectWindowsPhysicalInterface(windowsNetworkInterfaces(), windowsIPv4DefaultRoutes())
+	interfaces, err := windowsNetworkInterfaces()
+	if err != nil {
+		return "", errors.New("无法读取 Windows 网卡信息，请确认系统网络服务正常后重试；Cage 外网保持关闭")
+	}
+	routes, err := windowsIPv4DefaultRoutes()
+	if err != nil {
+		return "", errors.New("无法读取 Windows 路由信息，请确认系统网络服务正常后重试；Cage 外网保持关闭")
+	}
+	selected, err := selectWindowsPhysicalInterface(interfaces, routes)
 	if err != nil {
 		return "", err
 	}
@@ -276,11 +284,15 @@ func windowsPhysicalInterface(ctx context.Context) (string, error) {
 }
 
 type windowsInterface struct {
-	index    int
-	name     string
-	physical bool
-	up       bool
-	usable   bool
+	index           int
+	name            string
+	hardware        bool
+	up              bool
+	usable          bool
+	luid            uint64
+	interfaceType   uint32
+	tunnelType      uint32
+	interfaceMetric uint32
 }
 
 type windowsRoute struct {
@@ -296,61 +308,95 @@ type windowsSelectedInterface struct {
 func selectWindowsPhysicalInterface(interfaces []windowsInterface, routes []windowsRoute) (windowsSelectedInterface, error) {
 	usable := make(map[int]windowsInterface, len(interfaces))
 	for _, candidate := range interfaces {
-		if candidate.index > 0 && candidate.physical && candidate.up && candidate.usable {
-			usable[candidate.index] = candidate
+		if candidate.index > 0 && candidate.hardware && candidate.up && candidate.usable && physicalAdapterType(candidate.interfaceType, candidate.tunnelType) {
+			if _, exists := usable[candidate.index]; !exists {
+				usable[candidate.index] = candidate
+			}
 		}
 	}
-	type scoredRoute struct {
-		windowsInterface
-		metric uint32
-	}
-	scored := make([]scoredRoute, 0, len(routes))
-	for _, route := range routes {
-		if candidate, ok := usable[route.index]; ok {
-			scored = append(scored, scoredRoute{windowsInterface: candidate, metric: route.metric})
+	if len(routes) > 0 {
+		type scoredRoute struct {
+			windowsInterface
+			metric uint32
 		}
-	}
-	sort.Slice(scored, func(i, j int) bool {
-		if scored[i].metric != scored[j].metric {
-			return scored[i].metric < scored[j].metric
+		scored := make([]scoredRoute, 0, len(routes))
+		for _, route := range routes {
+			if candidate, ok := usable[route.index]; ok {
+				scored = append(scored, scoredRoute{
+					windowsInterface: candidate,
+					metric:           route.metric + candidate.interfaceMetric,
+				})
+			}
 		}
-		return scored[i].index < scored[j].index
-	})
-	if len(scored) > 0 {
+		if len(scored) == 0 {
+			return windowsSelectedInterface{}, errors.New("未找到可用的物理 IPv4 默认路由。请连接以太网或 Wi-Fi；Cage 外网保持关闭")
+		}
+		sort.Slice(scored, func(i, j int) bool {
+			if scored[i].metric != scored[j].metric {
+				return scored[i].metric < scored[j].metric
+			}
+			return scored[i].index < scored[j].index
+		})
 		return windowsSelectedInterface{index: scored[0].index, name: scored[0].name}, nil
 	}
-	for _, candidate := range interfaces {
-		if _, ok := usable[candidate.index]; ok {
-			return windowsSelectedInterface{index: candidate.index, name: candidate.name}, nil
-		}
+	ordered := make([]windowsInterface, 0, len(usable))
+	for _, candidate := range usable {
+		ordered = append(ordered, candidate)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].index < ordered[j].index })
+	if len(ordered) > 0 {
+		return windowsSelectedInterface{index: ordered[0].index, name: ordered[0].name}, nil
 	}
 	return windowsSelectedInterface{}, errors.New("未找到可用的物理 IPv4 网卡。请连接以太网或 Wi-Fi；仅有虚拟网卡的 Windows 虚拟机和云主机暂不可用。Cage 外网保持关闭")
 }
 
-func windowsNetworkInterfaces() []windowsInterface {
+func windowsNetworkInterfaces() ([]windowsInterface, error) {
 	const flags = windows.GAA_FLAG_SKIP_ANYCAST |
 		windows.GAA_FLAG_SKIP_MULTICAST |
 		windows.GAA_FLAG_SKIP_DNS_SERVER |
 		windows.GAA_FLAG_INCLUDE_TUNNEL_BINDINGORDER
-	var needed uint32
-	if err := windows.GetAdaptersAddresses(windows.AF_UNSPEC, flags, 0, nil, &needed); err != nil && err != windows.ERROR_BUFFER_OVERFLOW {
-		return nil
+	var ifTable *windows.MibIfTable2
+	if err := windows.GetIfTable2Ex(windows.MibIfTableNormalWithoutStatistics, &ifTable); err != nil {
+		return nil, err
 	}
-	buffer := make([]byte, needed)
-	addresses := (*windows.IpAdapterAddresses)(unsafe.Pointer(&buffer[0]))
-	if err := windows.GetAdaptersAddresses(windows.AF_UNSPEC, flags, 0, addresses, &needed); err != nil {
-		return nil
+	defer windows.FreeMibTable(unsafe.Pointer(ifTable))
+	ifRows := make(map[int]windows.MibIfRow2, ifTable.NumEntries)
+	for index := 0; index < int(ifTable.NumEntries); index++ {
+		row := *(*windows.MibIfRow2)(unsafe.Pointer(uintptr(unsafe.Pointer(&ifTable.Table)) + uintptr(index)*unsafe.Sizeof(windows.MibIfRow2{})))
+		ifRows[int(row.InterfaceIndex)] = row
+	}
+	var buffer []byte
+	var addresses *windows.IpAdapterAddresses
+	const maxAttempts = 4
+	for attempt := 0; ; attempt++ {
+		var needed uint32
+		err := windows.GetAdaptersAddresses(windows.AF_UNSPEC, flags, 0, addresses, &needed)
+		if err == nil && addresses != nil {
+			break
+		}
+		if err != nil && err != windows.ERROR_BUFFER_OVERFLOW || needed == 0 || attempt+1 >= maxAttempts {
+			return nil, err
+		}
+		buffer = make([]byte, needed)
+		addresses = (*windows.IpAdapterAddresses)(unsafe.Pointer(&buffer[0]))
 	}
 	var result []windowsInterface
 	for adapter := addresses; adapter != nil; adapter = adapter.Next {
 		if adapter.IfIndex == 0 || adapter.FriendlyName == nil {
 			continue
 		}
+		row, ok := ifRows[int(adapter.IfIndex)]
+		if !ok {
+			continue
+		}
 		candidate := windowsInterface{
-			index:    int(adapter.IfIndex),
-			name:     windows.UTF16ToString(unsafe.Slice(adapter.FriendlyName, 1<<16)),
-			physical: physicalAdapterType(adapter.IfType, adapter.TunnelType),
-			up:       adapter.OperStatus == windows.IfOperStatusUp,
+			index:         int(adapter.IfIndex),
+			name:          windows.UTF16PtrToString(adapter.FriendlyName),
+			hardware:      row.InterfaceAndOperStatusFlags&0x08 != 0,
+			up:            adapter.OperStatus == windows.IfOperStatusUp,
+			luid:          row.InterfaceLuid,
+			interfaceType: row.Type,
+			tunnelType:    row.TunnelType,
 		}
 		for address := adapter.FirstUnicastAddress; address != nil; address = address.Next {
 			ip := address.Address.IP()
@@ -362,9 +408,18 @@ func windowsNetworkInterfaces() []windowsInterface {
 				break
 			}
 		}
+		if !candidate.hardware || !physicalAdapterType(candidate.interfaceType, candidate.tunnelType) {
+			continue
+		}
+		interfaceRow := windows.MibIpInterfaceRow{Family: windows.AF_INET, InterfaceLuid: candidate.luid}
+		if err := windows.GetIpInterfaceEntry(&interfaceRow); err == nil && interfaceRow.Metric != 0 {
+			candidate.interfaceMetric = interfaceRow.Metric
+		} else {
+			candidate.interfaceMetric = 1
+		}
 		result = append(result, candidate)
 	}
-	return result
+	return result, nil
 }
 func physicalAdapterType(interfaceType, tunnelType uint32) bool {
 	switch interfaceType {
@@ -375,10 +430,13 @@ func physicalAdapterType(interfaceType, tunnelType uint32) bool {
 	}
 }
 
-func windowsIPv4DefaultRoutes() []windowsRoute {
+func windowsIPv4DefaultRoutes() ([]windowsRoute, error) {
 	var table *windows.MibIpForwardTable2
 	if err := windows.GetIpForwardTable2(windows.AF_INET, &table); err != nil {
-		return nil
+		return nil, err
+	}
+	if table == nil {
+		return nil, windows.ERROR_INTERNAL_ERROR
 	}
 	defer windows.FreeMibTable(unsafe.Pointer(table))
 	var routes []windowsRoute
@@ -392,5 +450,5 @@ func windowsIPv4DefaultRoutes() []windowsRoute {
 		}
 		routes = append(routes, windowsRoute{index: int(row.InterfaceIndex), metric: row.Metric})
 	}
-	return routes
+	return routes, nil
 }
