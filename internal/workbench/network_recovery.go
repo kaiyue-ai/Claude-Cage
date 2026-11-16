@@ -67,8 +67,8 @@ func recoveryMatches(r networkRecovery, state cage.GateStatus, configuration str
 	return r.RunID != "" && !paused && generation == r.PauseVersion && state.RunID == r.RunID && state.Configuration == r.Configuration && configuration == r.Configuration && state.Epoch == r.Epoch && state.Mode == cage.GateClosed
 }
 
-// Called with s.op held. Admission uses the ordinary job queue and never changes
-// saved network intent. The worker rechecks after acquiring s.op as well.
+// The worker rechecks after acquiring s.op. Admission uses the ordinary job
+// queue and never changes saved network intent.
 func (s *Server) recoverNetwork() {
 	s.mu.Lock()
 	r := s.recovery

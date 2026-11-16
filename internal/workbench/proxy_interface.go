@@ -8,7 +8,8 @@ import (
 
 var physicalProxyInterface = managedproxy.PhysicalInterface
 
-// The lifecycle lock is held by monitorNetwork. Schedule a regular job so a
+// monitorNetworkOp serializes network ticks; the lifecycle lock is deliberately
+// not held while probing the physical interface. Schedule a regular job so a
 // user stop can cancel recovery and pause can still revoke the gate immediately.
 func (s *Server) monitorProxyInterface() {
 	if s.busy() {
@@ -32,6 +33,9 @@ func (s *Server) monitorProxyInterface() {
 	s.mu.Unlock()
 	bound, err := managedproxy.BoundInterface(filepath.Join(managedproxy.Dir(s.profile), "config.yaml"))
 	if err != nil || (bound == name && !lost) {
+		return
+	}
+	if s.busy() {
 		return
 	}
 	// Revoke the previous report before the asynchronous recovery can start.

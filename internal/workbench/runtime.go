@@ -249,7 +249,7 @@ func (s *Server) monitor(ctx context.Context) {
 				}
 				timing.stage("environment_health")
 				if s.macosGuest != nil {
-					s.monitorNetworkTick()
+					s.monitorNetworkWithTick(s.monitorNetworkTick)
 					timing.stage("network_tick")
 				}
 			} else {

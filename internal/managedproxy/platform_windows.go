@@ -263,11 +263,11 @@ func windowsPhysicalInterface(ctx context.Context) (string, error) {
 	}
 	interfaces, err := windowsNetworkInterfaces()
 	if err != nil {
-		return "", errors.New("无法读取 Windows 网卡信息，请确认系统网络服务正常后重试；Cage 外网保持关闭")
+		return "", fmt.Errorf("无法读取 Windows 网卡信息，请确认系统网络服务正常后重试；Cage 外网保持关闭: %w", err)
 	}
 	routes, err := windowsIPv4DefaultRoutes()
 	if err != nil {
-		return "", errors.New("无法读取 Windows 路由信息，请确认系统网络服务正常后重试；Cage 外网保持关闭")
+		return "", fmt.Errorf("无法读取 Windows 路由信息，请确认系统网络服务正常后重试；Cage 外网保持关闭: %w", err)
 	}
 	selected, err := selectWindowsPhysicalInterface(interfaces, routes)
 	if err != nil {
@@ -452,6 +452,7 @@ func windowsIPv4DefaultRoutes() ([]windowsRoute, error) {
 		if row.DestinationPrefix.PrefixLength != 0 || row.NextHop.Family != windows.AF_INET || row.InterfaceIndex == 0 {
 			continue
 		}
+		// SOCKADDR_IN4 begins with the family and port before its four-byte address.
 		nextHop := (*windows.RawSockaddrInet4)(unsafe.Pointer(&row.NextHop)).Addr[:]
 		if net.IP(nextHop).Equal(net.IPv4zero) {
 			continue
