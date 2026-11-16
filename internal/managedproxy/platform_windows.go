@@ -339,15 +339,7 @@ func selectWindowsPhysicalInterface(interfaces []windowsInterface, routes []wind
 		})
 		return windowsSelectedInterface{index: scored[0].index, name: scored[0].name}, nil
 	}
-	ordered := make([]windowsInterface, 0, len(usable))
-	for _, candidate := range usable {
-		ordered = append(ordered, candidate)
-	}
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].index < ordered[j].index })
-	if len(ordered) > 0 {
-		return windowsSelectedInterface{index: ordered[0].index, name: ordered[0].name}, nil
-	}
-	return windowsSelectedInterface{}, errors.New("未找到可用的物理 IPv4 网卡。请连接以太网或 Wi-Fi；仅有虚拟网卡的 Windows 虚拟机和云主机暂不可用。Cage 外网保持关闭")
+	return windowsSelectedInterface{}, errors.New("未找到可用的物理 IPv4 默认路由。请连接以太网或 Wi-Fi；Cage 外网保持关闭")
 }
 
 func windowsNetworkInterfaces() ([]windowsInterface, error) {
@@ -355,7 +347,6 @@ func windowsNetworkInterfaces() ([]windowsInterface, error) {
 		windows.GAA_FLAG_SKIP_MULTICAST |
 		windows.GAA_FLAG_SKIP_DNS_SERVER |
 		windows.GAA_FLAG_INCLUDE_TUNNEL_BINDINGORDER
-	const unknownInterfaceMetric = 1 << 30
 	var needed uint32
 	if err := windows.GetAdaptersAddresses(windows.AF_UNSPEC, flags, 0, nil, &needed); err != nil && err != windows.ERROR_BUFFER_OVERFLOW {
 		return nil, err
@@ -379,7 +370,9 @@ func windowsNetworkInterfaces() ([]windowsInterface, error) {
 			}
 			return nil, err
 		}
-		needed = size
+		if size > needed {
+			needed = size
+		}
 	}
 	var ifTable *windows.MibIfTable2
 	if err := windows.GetIfTable2Ex(windows.MibIfTableNormalWithoutStatistics, &ifTable); err != nil {
@@ -423,11 +416,10 @@ func windowsNetworkInterfaces() ([]windowsInterface, error) {
 			continue
 		}
 		interfaceRow := windows.MibIpInterfaceRow{Family: windows.AF_INET, InterfaceLuid: candidate.luid}
-		if err := windows.GetIpInterfaceEntry(&interfaceRow); err == nil {
-			candidate.interfaceMetric = interfaceRow.Metric
-		} else {
-			candidate.interfaceMetric = unknownInterfaceMetric
+		if err := windows.GetIpInterfaceEntry(&interfaceRow); err != nil {
+			return nil, err
 		}
+		candidate.interfaceMetric = interfaceRow.Metric
 		result = append(result, candidate)
 	}
 	return result, nil

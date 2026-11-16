@@ -26,17 +26,13 @@ func TestSelectWindowsPhysicalInterfacePrefersBestDefaultRoute(t *testing.T) {
 	}
 }
 
-func TestSelectWindowsPhysicalInterfaceFallsBackToAnyUsableAdapter(t *testing.T) {
+func TestSelectWindowsPhysicalInterfaceRejectsRouteNotFound(t *testing.T) {
 	interfaces := []windowsInterface{
 		{index: 8, name: "Ethernet", hardware: true, up: true, usable: true, interfaceType: 6},
 		{index: 7, name: "Wi-Fi", hardware: true, up: true, usable: true, interfaceType: 71},
 	}
-	selected, err := selectWindowsPhysicalInterface(interfaces, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if selected.index != 7 || selected.name != "Wi-Fi" {
-		t.Fatalf("selected %+v; want first usable adapter", selected)
+	if _, err := selectWindowsPhysicalInterface(interfaces, nil); err == nil {
+		t.Fatal("selected an adapter without a default route")
 	}
 }
 
