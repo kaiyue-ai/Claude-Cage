@@ -355,6 +355,32 @@ func windowsNetworkInterfaces() ([]windowsInterface, error) {
 		windows.GAA_FLAG_SKIP_MULTICAST |
 		windows.GAA_FLAG_SKIP_DNS_SERVER |
 		windows.GAA_FLAG_INCLUDE_TUNNEL_BINDINGORDER
+	const unknownInterfaceMetric = 1 << 30
+	var needed uint32
+	if err := windows.GetAdaptersAddresses(windows.AF_UNSPEC, flags, 0, nil, &needed); err != nil && err != windows.ERROR_BUFFER_OVERFLOW {
+		return nil, err
+	}
+	if needed == 0 {
+		return nil, windows.ERROR_INSUFFICIENT_BUFFER
+	}
+	var addresses *windows.IpAdapterAddresses
+	const maxAttempts = 4
+	for attempt := 0; ; attempt++ {
+		buffer := make([]byte, needed)
+		addresses = (*windows.IpAdapterAddresses)(unsafe.Pointer(&buffer[0]))
+		size := needed
+		err := windows.GetAdaptersAddresses(windows.AF_UNSPEC, flags, 0, addresses, &size)
+		if err == nil && addresses != nil {
+			break
+		}
+		if err != nil && err != windows.ERROR_BUFFER_OVERFLOW || size == 0 || attempt+1 >= maxAttempts {
+			if err == nil {
+				err = windows.ERROR_INSUFFICIENT_BUFFER
+			}
+			return nil, err
+		}
+		needed = size
+	}
 	var ifTable *windows.MibIfTable2
 	if err := windows.GetIfTable2Ex(windows.MibIfTableNormalWithoutStatistics, &ifTable); err != nil {
 		return nil, err
@@ -364,21 +390,6 @@ func windowsNetworkInterfaces() ([]windowsInterface, error) {
 	for index := 0; index < int(ifTable.NumEntries); index++ {
 		row := *(*windows.MibIfRow2)(unsafe.Pointer(uintptr(unsafe.Pointer(&ifTable.Table)) + uintptr(index)*unsafe.Sizeof(windows.MibIfRow2{})))
 		ifRows[int(row.InterfaceIndex)] = row
-	}
-	var buffer []byte
-	var addresses *windows.IpAdapterAddresses
-	const maxAttempts = 4
-	for attempt := 0; ; attempt++ {
-		var needed uint32
-		err := windows.GetAdaptersAddresses(windows.AF_UNSPEC, flags, 0, addresses, &needed)
-		if err == nil && addresses != nil {
-			break
-		}
-		if err != nil && err != windows.ERROR_BUFFER_OVERFLOW || needed == 0 || attempt+1 >= maxAttempts {
-			return nil, err
-		}
-		buffer = make([]byte, needed)
-		addresses = (*windows.IpAdapterAddresses)(unsafe.Pointer(&buffer[0]))
 	}
 	var result []windowsInterface
 	for adapter := addresses; adapter != nil; adapter = adapter.Next {
@@ -392,7 +403,7 @@ func windowsNetworkInterfaces() ([]windowsInterface, error) {
 		candidate := windowsInterface{
 			index:         int(adapter.IfIndex),
 			name:          windows.UTF16PtrToString(adapter.FriendlyName),
-			hardware:      row.InterfaceAndOperStatusFlags&0x08 != 0,
+			hardware:      mibIfHardwareInterface(row.InterfaceAndOperStatusFlags),
 			up:            adapter.OperStatus == windows.IfOperStatusUp,
 			luid:          row.InterfaceLuid,
 			interfaceType: row.Type,
@@ -412,10 +423,10 @@ func windowsNetworkInterfaces() ([]windowsInterface, error) {
 			continue
 		}
 		interfaceRow := windows.MibIpInterfaceRow{Family: windows.AF_INET, InterfaceLuid: candidate.luid}
-		if err := windows.GetIpInterfaceEntry(&interfaceRow); err == nil && interfaceRow.Metric != 0 {
+		if err := windows.GetIpInterfaceEntry(&interfaceRow); err == nil {
 			candidate.interfaceMetric = interfaceRow.Metric
 		} else {
-			candidate.interfaceMetric = 1
+			candidate.interfaceMetric = unknownInterfaceMetric
 		}
 		result = append(result, candidate)
 	}
@@ -428,6 +439,11 @@ func physicalAdapterType(interfaceType, tunnelType uint32) bool {
 	default:
 		return false
 	}
+}
+
+func mibIfHardwareInterface(flags uint8) bool {
+	const hardwareInterfaceFlag = 0x01
+	return flags&hardwareInterfaceFlag != 0
 }
 
 func windowsIPv4DefaultRoutes() ([]windowsRoute, error) {

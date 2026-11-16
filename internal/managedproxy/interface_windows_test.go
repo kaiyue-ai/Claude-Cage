@@ -64,3 +64,12 @@ func TestPhysicalAdapterTypeExcludesTunnels(t *testing.T) {
 		t.Fatal("accepted a tunnel adapter")
 	}
 }
+
+func TestMIBIfHardwareInterfaceBit(t *testing.T) {
+	if !mibIfHardwareInterface(0x01) || !mibIfHardwareInterface(0x89) {
+		t.Fatal("failed to recognize hardware interface flag")
+	}
+	if mibIfHardwareInterface(0x08) || mibIfHardwareInterface(0x10) {
+		t.Fatal("misclassified non-hardware interface flags")
+	}
+}
