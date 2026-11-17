@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -375,12 +376,11 @@ func windowsNetworkInterfaces(ctx context.Context) ([]windowsInterface, error) {
 	}
 	var addresses *windows.IpAdapterAddresses
 	const maxAttempts = 4
-	var buffer []byte
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		buffer = make([]byte, needed)
+		buffer := make([]byte, needed)
 		addresses = (*windows.IpAdapterAddresses)(unsafe.Pointer(&buffer[0]))
 		size := needed
 		err := windows.GetAdaptersAddresses(windows.AF_UNSPEC, flags, 0, addresses, &size)
@@ -396,6 +396,7 @@ func windowsNetworkInterfaces(ctx context.Context) ([]windowsInterface, error) {
 		if size > needed {
 			needed = size
 		}
+		runtime.KeepAlive(buffer)
 	}
 	var ifTable *windows.MibIfTable2
 	if err := ctx.Err(); err != nil {
@@ -444,13 +445,12 @@ func windowsNetworkInterfaces(ctx context.Context) ([]windowsInterface, error) {
 		if !candidate.hardware || !physicalAdapterType(candidate.interfaceType, candidate.tunnelType) {
 			continue
 		}
-		interfaceRow := windowsMibIPInterfaceRow{Family: windows.AF_INET, InterfaceLuid: candidate.luid}
-		interfaceRow.Size = uint32(unsafe.Sizeof(interfaceRow))
+		interfaceRow := windows.MibIpInterfaceRow{Family: windows.AF_INET, InterfaceLuid: candidate.luid}
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		if err := windowsGetIPInterfaceEntry(&interfaceRow); err != nil {
-			return nil, err
+			continue
 		}
 		candidate.interfaceMetric = interfaceRow.Metric
 		result = append(result, candidate)
@@ -458,51 +458,14 @@ func windowsNetworkInterfaces(ctx context.Context) ([]windowsInterface, error) {
 	return result, nil
 }
 
-type windowsMibIPInterfaceRow struct {
-	Size                                 uint32
-	Family                               uint16
-	_                                    uint16
-	InterfaceLuid                        uint64
-	InterfaceIndex                       uint32
-	MaxReassemblySize                    uint32
-	InterfaceIdentifier                  uint64
-	MinRouterAdvertisementInterval       uint32
-	MaxRouterAdvertisementInterval       uint32
-	AdvertisingEnabled                   uint8
-	ForwardingEnabled                    uint8
-	WeakHostSend                         uint8
-	WeakHostReceive                      uint8
-	UseAutomaticMetric                   uint8
-	UseNeighborUnreachabilityDetection   uint8
-	ManagedAddressConfigurationSupported uint8
-	OtherStatefulConfigurationSupported  uint8
-	AdvertiseDefaultRoute                uint8
-	RouterDiscoveryBehavior              uint32
-	DadTransmits                         uint32
-	BaseReachableTime                    uint32
-	RetransmitTime                       uint32
-	PathMtuDiscoveryTimeout              uint32
-	LinkLocalAddressBehavior             uint32
-	LinkLocalAddressTimeout              uint32
-	ZoneIndices                          [16]uint32
-	SitePrefixLength                     uint32
-	Metric                               uint32
-	NlMtu                                uint32
-	Connected                            uint8
-	SupportsWakeUpPatterns               uint8
-	SupportsNeighborDiscovery            uint8
-	SupportsRouterDiscovery              uint8
-	ReachableTime                        uint32
-	TransmitOffload                      uint32
-	ReceiveOffload                       uint32
-	DisableDefaultRoutes                 uint8
-}
-
 var windowsIPHlpAPI = windows.NewLazySystemDLL("iphlpapi.dll")
 
-func windowsGetIPInterfaceEntry(row *windowsMibIPInterfaceRow) error {
+func windowsGetIPInterfaceEntry(row *windows.MibIpInterfaceRow) error {
 	proc := windowsIPHlpAPI.NewProc("GetIpInterfaceEntry")
-	result, _, _ := proc.Call(uintptr(unsafe.Pointer(row)))
+	result, _, callErr := proc.Call(uintptr(unsafe.Pointer(row)))
+	if callErr != nil {
+		return callErr
+	}
 	if result != 0 {
 		return windows.Errno(result)
 	}

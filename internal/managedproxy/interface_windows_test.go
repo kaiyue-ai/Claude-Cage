@@ -7,7 +7,7 @@ import (
 func TestSelectWindowsPhysicalInterfacePrefersBestDefaultRoute(t *testing.T) {
 	interfaces := []windowsInterface{
 		{index: 1, name: "Loopback Pseudo-Interface 1", hardware: false, up: true, usable: true, interfaceType: 6},
-		{index: 2, name: "Ethernet", hardware: true, up: true, usable: true, interfaceType: 6, interfaceMetric: 25},
+		{index: 2, name: "Ethernet", hardware: true, up: true, usable: true, interfaceType: 6, interfaceMetric: 5},
 		{index: 3, name: "Wi-Fi", hardware: true, up: true, usable: true, interfaceType: 71, luid: 33, interfaceMetric: 5},
 		{index: 4, name: "vEthernet", hardware: false, up: true, usable: true, interfaceType: 6},
 		{index: 5, name: "Disconnected", hardware: true, up: false, usable: true, interfaceType: 6},
