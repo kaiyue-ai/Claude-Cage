@@ -7,8 +7,8 @@ import (
 func TestSelectWindowsPhysicalInterfacePrefersBestDefaultRoute(t *testing.T) {
 	interfaces := []windowsInterface{
 		{index: 1, name: "Loopback Pseudo-Interface 1", hardware: false, up: true, usable: true, interfaceType: 6},
-		{index: 2, name: "Ethernet", hardware: true, up: true, usable: true, interfaceType: 6},
-		{index: 3, name: "Wi-Fi", hardware: true, up: true, usable: true, interfaceType: 71, luid: 33},
+		{index: 2, name: "Ethernet", hardware: true, up: true, usable: true, interfaceType: 6, interfaceMetric: 25},
+		{index: 3, name: "Wi-Fi", hardware: true, up: true, usable: true, interfaceType: 71, luid: 33, interfaceMetric: 5},
 		{index: 4, name: "vEthernet", hardware: false, up: true, usable: true, interfaceType: 6},
 		{index: 5, name: "Disconnected", hardware: true, up: false, usable: true, interfaceType: 6},
 	}
@@ -26,18 +26,33 @@ func TestSelectWindowsPhysicalInterfacePrefersBestDefaultRoute(t *testing.T) {
 	}
 }
 
-func TestSelectWindowsPhysicalInterfaceUsesRouteMetricOnly(t *testing.T) {
+func TestSelectWindowsPhysicalInterfaceUsesCombinedMetric(t *testing.T) {
 	interfaces := []windowsInterface{
-		{index: 2, name: "Ethernet", hardware: true, up: true, usable: true, interfaceType: 6},
-		{index: 3, name: "Wi-Fi", hardware: true, up: true, usable: true, interfaceType: 71},
+		{index: 2, name: "Ethernet", hardware: true, up: true, usable: true, interfaceType: 6, interfaceMetric: 10},
+		{index: 3, name: "Wi-Fi", hardware: true, up: true, usable: true, interfaceType: 71, interfaceMetric: 50},
 	}
 	routes := []windowsRoute{{index: 3, metric: 1}, {index: 2, metric: 10}}
 	selected, err := selectWindowsPhysicalInterface(interfaces, routes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if selected.index != 3 {
-		t.Fatalf("selected %+v; want Wi-Fi", selected)
+	if selected.index != 2 {
+		t.Fatalf("selected %+v; want Ethernet with lower combined metric", selected)
+	}
+}
+
+func TestSelectWindowsPhysicalInterfaceBreaksMetricTieByIndex(t *testing.T) {
+	interfaces := []windowsInterface{
+		{index: 4, name: "Wi-Fi", hardware: true, up: true, usable: true, interfaceType: 71, interfaceMetric: 5},
+		{index: 2, name: "Ethernet", hardware: true, up: true, usable: true, interfaceType: 6, interfaceMetric: 5},
+	}
+	routes := []windowsRoute{{index: 4, metric: 10}, {index: 2, metric: 10}}
+	selected, err := selectWindowsPhysicalInterface(interfaces, routes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.index != 2 {
+		t.Fatalf("selected %+v; want lower interface index", selected)
 	}
 }
 
@@ -80,8 +95,8 @@ func TestSelectWindowsPhysicalInterfaceRequiresDefaultRoute(t *testing.T) {
 }
 
 func TestPhysicalAdapterTypeExcludesTunnels(t *testing.T) {
-	if !physicalAdapterType(6, 0) || !physicalAdapterType(71, 0) {
-		t.Fatal("rejected Ethernet or Wi-Fi")
+	if !physicalAdapterType(6, 0) || !physicalAdapterType(71, 0) || !physicalAdapterType(225, 0) || !physicalAdapterType(243, 0) || !physicalAdapterType(244, 0) {
+		t.Fatal("rejected Ethernet, Wi-Fi, Bluetooth PAN or WWAN")
 	}
 	if physicalAdapterType(6, 1) || physicalAdapterType(131, 0) {
 		t.Fatal("accepted a tunnel adapter")

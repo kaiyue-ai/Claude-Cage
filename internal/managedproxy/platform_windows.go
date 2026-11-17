@@ -258,14 +258,19 @@ func startWindowsCore(ctx context.Context, profile string, s Store) error {
 }
 
 func windowsPhysicalInterface(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	interfaces, err := windowsNetworkInterfaces()
+	interfaces, err := windowsNetworkInterfaces(ctx)
 	if err != nil {
 		return "", fmt.Errorf("无法读取 Windows 网卡信息，请确认系统网络服务正常后重试；Cage 外网保持关闭: %w", err)
 	}
-	routes, err := windowsIPv4DefaultRoutes()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	routes, err := windowsIPv4DefaultRoutes(ctx)
 	if err != nil {
 		return "", fmt.Errorf("无法读取 Windows 路由信息，请确认系统网络服务正常后重试；Cage 外网保持关闭: %w", err)
 	}
@@ -284,14 +289,15 @@ func windowsPhysicalInterface(ctx context.Context) (string, error) {
 }
 
 type windowsInterface struct {
-	index         int
-	name          string
-	hardware      bool
-	up            bool
-	usable        bool
-	luid          uint64
-	interfaceType uint32
-	tunnelType    uint32
+	index           int
+	name            string
+	hardware        bool
+	up              bool
+	usable          bool
+	luid            uint64
+	interfaceType   uint32
+	tunnelType      uint32
+	interfaceMetric uint32
 }
 
 type windowsRoute struct {
@@ -323,7 +329,7 @@ func selectWindowsPhysicalInterface(interfaces []windowsInterface, routes []wind
 	if len(routes) > 0 {
 		type scoredRoute struct {
 			windowsInterface
-			metric uint32
+			metric uint64
 		}
 		scored := make([]scoredRoute, 0, len(routes))
 		for _, route := range routes {
@@ -334,7 +340,7 @@ func selectWindowsPhysicalInterface(interfaces []windowsInterface, routes []wind
 			if ok {
 				scored = append(scored, scoredRoute{
 					windowsInterface: candidate,
-					metric:           route.metric,
+					metric:           uint64(route.metric) + uint64(candidate.interfaceMetric),
 				})
 			}
 		}
@@ -352,12 +358,15 @@ func selectWindowsPhysicalInterface(interfaces []windowsInterface, routes []wind
 	return windowsSelectedInterface{}, errors.New("未找到可用的物理 IPv4 默认路由。请连接以太网或 Wi-Fi；Cage 外网保持关闭")
 }
 
-func windowsNetworkInterfaces() ([]windowsInterface, error) {
+func windowsNetworkInterfaces(ctx context.Context) ([]windowsInterface, error) {
 	const flags = windows.GAA_FLAG_SKIP_ANYCAST |
 		windows.GAA_FLAG_SKIP_MULTICAST |
 		windows.GAA_FLAG_SKIP_DNS_SERVER |
 		windows.GAA_FLAG_INCLUDE_TUNNEL_BINDINGORDER
 	var needed uint32
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := windows.GetAdaptersAddresses(windows.AF_UNSPEC, flags, 0, nil, &needed); err != nil && err != windows.ERROR_BUFFER_OVERFLOW {
 		return nil, err
 	}
@@ -366,8 +375,12 @@ func windowsNetworkInterfaces() ([]windowsInterface, error) {
 	}
 	var addresses *windows.IpAdapterAddresses
 	const maxAttempts = 4
+	var buffer []byte
 	for attempt := 0; ; attempt++ {
-		buffer := make([]byte, needed)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		buffer = make([]byte, needed)
 		addresses = (*windows.IpAdapterAddresses)(unsafe.Pointer(&buffer[0]))
 		size := needed
 		err := windows.GetAdaptersAddresses(windows.AF_UNSPEC, flags, 0, addresses, &size)
@@ -385,6 +398,9 @@ func windowsNetworkInterfaces() ([]windowsInterface, error) {
 		}
 	}
 	var ifTable *windows.MibIfTable2
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := windows.GetIfTable2Ex(windows.MibIfTableNormalWithoutStatistics, &ifTable); err != nil {
 		return nil, err
 	}
@@ -396,6 +412,9 @@ func windowsNetworkInterfaces() ([]windowsInterface, error) {
 	}
 	var result []windowsInterface
 	for adapter := addresses; adapter != nil; adapter = adapter.Next {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if adapter.IfIndex == 0 || adapter.FriendlyName == nil {
 			continue
 		}
@@ -425,14 +444,79 @@ func windowsNetworkInterfaces() ([]windowsInterface, error) {
 		if !candidate.hardware || !physicalAdapterType(candidate.interfaceType, candidate.tunnelType) {
 			continue
 		}
+		interfaceRow := windowsMibIPInterfaceRow{Family: windows.AF_INET, InterfaceLuid: candidate.luid}
+		interfaceRow.Size = uint32(unsafe.Sizeof(interfaceRow))
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := windowsGetIPInterfaceEntry(&interfaceRow); err != nil {
+			return nil, err
+		}
+		candidate.interfaceMetric = interfaceRow.Metric
 		result = append(result, candidate)
 	}
 	return result, nil
 }
 
+type windowsMibIPInterfaceRow struct {
+	Size                                 uint32
+	Family                               uint16
+	_                                    uint16
+	InterfaceLuid                        uint64
+	InterfaceIndex                       uint32
+	MaxReassemblySize                    uint32
+	InterfaceIdentifier                  uint64
+	MinRouterAdvertisementInterval       uint32
+	MaxRouterAdvertisementInterval       uint32
+	AdvertisingEnabled                   uint8
+	ForwardingEnabled                    uint8
+	WeakHostSend                         uint8
+	WeakHostReceive                      uint8
+	UseAutomaticMetric                   uint8
+	UseNeighborUnreachabilityDetection   uint8
+	ManagedAddressConfigurationSupported uint8
+	OtherStatefulConfigurationSupported  uint8
+	AdvertiseDefaultRoute                uint8
+	RouterDiscoveryBehavior              uint32
+	DadTransmits                         uint32
+	BaseReachableTime                    uint32
+	RetransmitTime                       uint32
+	PathMtuDiscoveryTimeout              uint32
+	LinkLocalAddressBehavior             uint32
+	LinkLocalAddressTimeout              uint32
+	ZoneIndices                          [16]uint32
+	SitePrefixLength                     uint32
+	Metric                               uint32
+	NlMtu                                uint32
+	Connected                            uint8
+	SupportsWakeUpPatterns               uint8
+	SupportsNeighborDiscovery            uint8
+	SupportsRouterDiscovery              uint8
+	ReachableTime                        uint32
+	TransmitOffload                      uint32
+	ReceiveOffload                       uint32
+	DisableDefaultRoutes                 uint8
+}
+
+var windowsIPHlpAPI = windows.NewLazySystemDLL("iphlpapi.dll")
+
+func windowsGetIPInterfaceEntry(row *windowsMibIPInterfaceRow) error {
+	proc := windowsIPHlpAPI.NewProc("GetIpInterfaceEntry")
+	result, _, _ := proc.Call(uintptr(unsafe.Pointer(row)))
+	if result != 0 {
+		return windows.Errno(result)
+	}
+	return nil
+}
+
 func physicalAdapterType(interfaceType, tunnelType uint32) bool {
+	const (
+		ifTypeBluetoothPAN = 225
+		ifTypeWwanPP       = 243
+		ifTypeWwanPP2      = 244
+	)
 	switch interfaceType {
-	case windows.IF_TYPE_ETHERNET_CSMACD, windows.IF_TYPE_IEEE80211, windows.IF_TYPE_IEEE1394:
+	case windows.IF_TYPE_ETHERNET_CSMACD, windows.IF_TYPE_IEEE80211, windows.IF_TYPE_IEEE1394, ifTypeBluetoothPAN, ifTypeWwanPP, ifTypeWwanPP2:
 		return tunnelType == 0
 	default:
 		return false
@@ -444,7 +528,10 @@ func mibIfHardwareInterface(flags uint8) bool {
 	return flags&hardwareInterfaceFlag != 0
 }
 
-func windowsIPv4DefaultRoutes() ([]windowsRoute, error) {
+func windowsIPv4DefaultRoutes(ctx context.Context) ([]windowsRoute, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var table *windows.MibIpForwardTable2
 	if err := windows.GetIpForwardTable2(windows.AF_INET, &table); err != nil {
 		return nil, err
@@ -455,6 +542,9 @@ func windowsIPv4DefaultRoutes() ([]windowsRoute, error) {
 	defer windows.FreeMibTable(unsafe.Pointer(table))
 	var routes []windowsRoute
 	for _, row := range table.Rows() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if row.DestinationPrefix.PrefixLength != 0 || row.NextHop.Family != windows.AF_INET || row.InterfaceIndex == 0 && row.InterfaceLuid == 0 {
 			continue
 		}
