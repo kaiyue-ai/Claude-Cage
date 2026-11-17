@@ -3,6 +3,7 @@ package cage
 import (
 	"context"
 	"encoding/json"
+	"github.com/sylvinus/agent-vm/internal/guestprofile"
 	"github.com/sylvinus/agent-vm/internal/managedproxy"
 	"os"
 	"path/filepath"
@@ -57,6 +58,63 @@ func TestProxyRevisionRevokesOldReportAtSameEndpoint(t *testing.T) {
 	changed.ProxyURL = "socks5://127.0.0.1:3333"
 	if err = g.SyncProxyRevision(changed); err == nil {
 		t.Fatal("transport changed without environment restart")
+	}
+}
+
+func TestProxyRevisionAcceptsReloadedIdenticalGuestProfile(t *testing.T) {
+	profile := t.TempDir()
+	path := filepath.Join(profile, "config.json")
+	cfg := DefaultConfig()
+	cfg.ProxyRevision = "same-node"
+	p, err := guestprofile.New(guestprofile.Options{Username: "alex", BrowserUsername: "web", AudioName: "speaker123", AudioDescription: "USB Speakers", ExtensionName: "My Tab Layout"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.GuestProfile = p
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	pb, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(profile, guestprofile.Filename), pb, 0600); err != nil {
+		t.Fatal(err)
+	}
+	first, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, err := NewEgressGate(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Close("done")
+	second, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.GuestProfile == second.GuestProfile {
+		t.Fatal("test did not produce independently loaded guest profiles")
+	}
+	if err = gate.SyncProxyRevision(second); err != nil {
+		t.Fatal("identical reloaded guest profile was treated as an environment change:", err)
+	}
+	changed := second
+	changedProfile := *second.GuestProfile
+	changedProfile.ExtensionSuffix = "0123456789abcdef"
+	changed.GuestProfile = &changedProfile
+	if err = gate.SyncProxyRevision(changed); err == nil {
+		t.Fatal("changed guest profile was accepted without environment restart")
+	}
+	changed = second
+	changed.GuestProfile = nil
+	if err = gate.SyncProxyRevision(changed); err == nil {
+		t.Fatal("removed guest profile was accepted without environment restart")
 	}
 }
 
